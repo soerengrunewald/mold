@@ -387,6 +387,34 @@ parse_defsym_value(Context<E> &ctx, std::string_view s) {
   return get_symbol(ctx, s);
 }
 
+/// self contained string append for path elements
+static void append_unique(std::string& path, std::string_view const& arg)
+{
+  if (path.empty()) {
+    path = arg;
+    return;
+  }
+
+  // disaseble the path
+  auto e = split_by_comma_or_colon(path);
+  e.push_back(arg);
+
+  // remove doublicates
+  std::unordered_set<std::string_view> s;
+  auto end = std::remove_if(e.begin(), e.end(), [&s](auto const &i) { return !s.insert(i).second; });
+  e.erase(end, e.end());
+
+  // recreate the path
+  std::string p;
+  for (auto const& i : e) {
+    if (not p.empty())
+      p += ":";
+    p += i;
+  }
+
+  path = std::move(p);
+}
+
 template <typename E>
 std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
   std::span<std::string_view> args = ctx.cmdline_args;
@@ -968,17 +996,13 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
     } else if (read_flag("error-unresolved-symbols")) {
       ctx.arg.unresolved_symbols = UNRESOLVED_ERROR;
     } else if (read_arg("rpath")) {
-      if (!ctx.arg.rpaths.empty())
-        ctx.arg.rpaths += ":";
-      ctx.arg.rpaths += arg;
+      append_unique(ctx.arg.rpaths, arg);
     } else if (read_arg("R")) {
       if (is_file(arg))
         Fatal(ctx) << "-R" << arg
                    << ": -R as an alias for --just-symbols is not supported";
 
-      if (!ctx.arg.rpaths.empty())
-        ctx.arg.rpaths += ":";
-      ctx.arg.rpaths += arg;
+      append_unique(ctx.arg.rpaths, arg);
     } else if (read_flag("build-id")) {
       ctx.arg.build_id.kind = BuildId::HASH;
       ctx.arg.build_id.hash_size = 20;
