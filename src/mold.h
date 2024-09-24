@@ -313,8 +313,6 @@ public:
 private:
   void scan_pcrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
   void scan_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
-  void scan_dyn_absrel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
-  void scan_toc_rel(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
   void scan_tlsdesc(Context<E> &ctx, Symbol<E> &sym);
   void check_tlsle(Context<E> &ctx, Symbol<E> &sym, const ElfRel<E> &rel);
 
@@ -374,7 +372,7 @@ public:
   virtual i64 get_reldyn_size(Context<E> &ctx) const { return 0; }
   virtual void construct_relr(Context<E> &ctx) {}
   virtual void copy_buf(Context<E> &ctx) {}
-  virtual void write_to(Context<E> &ctx, u8 *buf) { unreachable(); }
+  virtual void write_to(Context<E> &ctx, u8 *buf, ElfRel<E> *rel) { unreachable(); }
   virtual void update_shdr(Context<E> &ctx) {}
 
   std::string_view name;
@@ -467,6 +465,24 @@ public:
   void copy_buf(Context<E> &ctx) override;
 };
 
+enum AbsRelKind {
+  ABS_REL_NONE,
+  ABS_REL_BASEREL,
+  ABS_REL_RELR,
+  ABS_REL_IFUNC,
+  ABS_REL_DYNREL,
+};
+
+// Represents a word-size absolute relocation (e.g. R_X86_64_64)
+template <typename E>
+struct AbsRel {
+  InputSection<E> *isec = nullptr;
+  u64 offset = 0;
+  Symbol<E> *sym = nullptr;
+  i64 addend = 0;
+  AbsRelKind kind = ABS_REL_NONE;
+};
+
 // Sections
 template <typename E>
 class OutputSection : public Chunk<E> {
@@ -478,18 +494,21 @@ public:
 
   OutputSection<E> *to_osec() override { return this; }
   void compute_section_size(Context<E> &ctx) override;
+  i64 get_reldyn_size(Context<E> &ctx) const override;
   void construct_relr(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
-  void write_to(Context<E> &ctx, u8 *buf) override;
+  void write_to(Context<E> &ctx, u8 *buf, ElfRel<E> *rel) override;
 
   void compute_symtab_size(Context<E> &ctx) override;
   void populate_symtab(Context<E> &ctx) override;
 
+  void scan_abs_relocations(Context<E> &ctx);
   void create_range_extension_thunks(Context<E> &ctx);
 
   std::vector<InputSection<E> *> members;
   std::vector<std::unique_ptr<Thunk<E>>> thunks;
   std::unique_ptr<RelocSection<E>> reloc_sec;
+  std::vector<AbsRel<E>> abs_rels;
   Atomic<u32> sh_flags;
 };
 
@@ -806,7 +825,7 @@ public:
   void resolve(Context<E> &ctx);
   void compute_section_size(Context<E> &ctx) override;
   void copy_buf(Context<E> &ctx) override;
-  void write_to(Context<E> &ctx, u8 *buf) override;
+  void write_to(Context<E> &ctx, u8 *buf, ElfRel<E> *rel) override;
   void print_stats(Context<E> &ctx);
 
   std::vector<MergeableSection<E> *> members;
@@ -1075,6 +1094,82 @@ private:
 };
 
 //
+// output-file.cc
+//
+
+template <typename E>
+class OutputFile {
+public:
+  static std::unique_ptr<OutputFile<E>>
+  open(Context<E> &ctx, std::string path, i64 filesize, int perm);
+
+  virtual void close(Context<E> &ctx) = 0;
+  virtual ~OutputFile() = default;
+
+  u8 *buf = nullptr;
+  std::vector<u8> buf2;
+  std::string path;
+  int fd = -1;
+  i64 filesize = 0;
+  bool is_mmapped = false;
+  bool is_unmapped = false;
+
+protected:
+  OutputFile(std::string path, i64 filesize, bool is_mmapped)
+    : path(path), filesize(filesize), is_mmapped(is_mmapped) {}
+};
+
+template <typename E>
+class MallocOutputFile : public OutputFile<E> {
+public:
+  MallocOutputFile(Context<E> &ctx, std::string path, i64 filesize, int perm)
+    : OutputFile<E>(path, filesize, false), ptr(new u8[filesize]),
+      perm(perm) {
+    this->buf = ptr.get();
+  }
+
+  void close(Context<E> &ctx) override {
+    Timer t(ctx, "close_file");
+    FILE *fp;
+
+    if (this->path == "-") {
+      fp = stdout;
+    } else {
+#ifdef _WIN32
+      int pmode = (perm & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD;
+      i64 fd = _open(this->path.c_str(), _O_RDWR | _O_CREAT | _O_BINARY, pmode);
+#else
+      i64 fd = ::open(this->path.c_str(), O_RDWR | O_CREAT, perm);
+#endif
+      if (fd == -1)
+        Fatal(ctx) << "cannot open " << this->path << ": " << errno_string();
+#ifdef _WIN32
+      fp = _fdopen(fd, "wb");
+#else
+      fp = fdopen(fd, "w");
+#endif
+    }
+
+    fwrite(this->buf, this->filesize, 1, fp);
+    if (!this->buf2.empty())
+      fwrite(this->buf2.data(), this->buf2.size(), 1, fp);
+    fclose(fp);
+  }
+
+private:
+  std::unique_ptr<u8[]> ptr;
+  int perm;
+};
+
+template <typename E>
+class LockingOutputFile : public OutputFile<E> {
+public:
+  LockingOutputFile(Context<E> &ctx, std::string path, int perm);
+  void resize(Context<E> &ctx, i64 filesize);
+  void close(Context<E> &ctx) override;
+};
+
+//
 // gdb-index.cc
 //
 
@@ -1217,6 +1312,7 @@ public:
 
   void parse(Context<E> &ctx);
   void initialize_symbols(Context<E> &ctx);
+  void parse_ehframe(Context<E> &ctx);
   void convert_mergeable_sections(Context<E> &ctx);
   void reattach_section_pieces(Context<E> &ctx);
   void resolve_symbols(Context<E> &ctx) override;
@@ -1248,9 +1344,6 @@ public:
   bool is_gcc_offload_obj = false;
   bool is_rust_obj = false;
 
-  i64 num_dynrel = 0;
-  i64 reldyn_offset = 0;
-
   i64 fde_idx = 0;
   i64 fde_offset = 0;
   i64 fde_size = 0;
@@ -1277,7 +1370,6 @@ private:
   void sort_relocations(Context<E> &ctx);
   void initialize_ehframe_sections(Context<E> &ctx);
   void parse_note_gnu_property(Context <E> &ctx, const ElfShdr <E> &shdr);
-  void parse_ehframe(Context<E> &ctx);
   void override_symbol(Context<E> &ctx, Symbol<E> &sym,
                        const ElfSym<E> &esym, i64 symidx);
   void merge_visibility(Context<E> &ctx, Symbol<E> &sym, u8 visibility);
@@ -1399,7 +1491,7 @@ template <typename E>
 ObjectFile<E> *read_lto_object(Context<E> &ctx, MappedFile *mb);
 
 template <typename E>
-std::vector<ObjectFile<E> *> do_lto(Context<E> &ctx);
+std::vector<ObjectFile<E> *> run_lto_plugin(Context<E> &ctx);
 
 template <typename E>
 void lto_cleanup(Context<E> &ctx);
@@ -1477,7 +1569,8 @@ template <typename E> void apply_exclude_libs(Context<E> &);
 template <typename E> void create_synthetic_sections(Context<E> &);
 template <typename E> void set_file_priority(Context<E> &);
 template <typename E> void resolve_symbols(Context<E> &);
-template <typename E> void kill_eh_frame_sections(Context<E> &);
+template <typename E> void do_lto(Context<E> &);
+template <typename E> void parse_eh_frame_sections(Context<E> &);
 template <typename E> void create_merged_sections(Context<E> &);
 template <typename E> void convert_common_symbols(Context<E> &);
 template <typename E> void create_output_sections(Context<E> &);
@@ -1897,7 +1990,7 @@ struct Context {
     std::string soname;
     std::string sysroot;
     std::string_view emulation;
-    std::unique_ptr<std::unordered_set<std::string_view>> retain_symbols_file;
+    std::optional<std::vector<Symbol<E> *>> retain_symbols_file;
     std::unordered_map<std::string_view, u64> section_align;
     std::unordered_map<std::string_view, u64> section_start;
     std::unordered_set<std::string_view> ignore_ir_file;
@@ -1956,7 +2049,7 @@ struct Context {
   std::vector<ElfSym<E>> internal_esyms;
 
   // Output buffer
-  std::unique_ptr<OutputFile<Context<E>>> output_file;
+  std::unique_ptr<OutputFile<E>> output_file;
   u8 *buf = nullptr;
   bool overwrite_output_file = true;
 
@@ -2339,6 +2432,10 @@ public:
   bool has_copyrel : 1 = false;
   bool is_copyrel_readonly : 1 = false;
 
+  // For symbol resolution. This flag is used rarely. See a comment in
+  // resolve_symbols().
+  bool skip_dso : 1 = false;
+
   // For --gc-sections
   bool gc_root : 1 = false;
 
@@ -2522,7 +2619,7 @@ inline bool InputSection<E>::icf_removed() const {
 template <typename E>
 std::pair<SectionFragment<E> *, i64>
 MergeableSection<E>::get_fragment(i64 offset) {
-  std::vector<u32> &vec = frag_offsets;
+  std::span<u32> vec = frag_offsets;
   auto it = std::upper_bound(vec.begin(), vec.end(), offset);
   i64 idx = it - 1 - vec.begin();
   return {fragments[idx], offset - vec[idx]};
@@ -3019,6 +3116,15 @@ inline bool is_c_identifier(std::string_view s) {
     if (!is_alnum(s[i]))
       return false;
   return true;
+}
+
+template <typename E>
+std::string_view save_string(Context<E> &ctx, const std::string &str) {
+  u8 *buf = new u8[str.size() + 1];
+  memcpy(buf, str.data(), str.size());
+  buf[str.size()] = '\0';
+  ctx.string_pool.push_back(std::unique_ptr<u8[]>(buf));
+  return {(char *)buf, str.size()};
 }
 
 } // namespace mold

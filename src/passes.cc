@@ -1,6 +1,5 @@
 #include "mold.h"
 #include "blake3.h"
-#include "../lib/output-file.h"
 
 #include <fstream>
 #include <functional>
@@ -257,152 +256,127 @@ static void clear_symbols(Context<E> &ctx) {
 }
 
 template <typename E>
-void do_resolve_symbols(Context<E> &ctx) {
+void resolve_symbols(Context<E> &ctx) {
+  Timer t(ctx, "resolve_symbols");
+
   std::vector<InputFile<E> *> files;
   append(files, ctx.objs);
   append(files, ctx.dsos);
 
-  // Due to legacy reasons, archive members will only get included in the final
-  // binary if they satisfy one of the undefined symbols in a non-archive object
-  // file. This is called archive extraction. In finalize_archive_extraction,
-  // this is processed as follows:
-  //
-  // 1. Do preliminary symbol resolution assuming all archive members
-  //    are included. This matches the undefined symbols with ones to be
-  //    extracted from archives.
-  //
-  // 2. Do a mark & sweep pass to eliminate unneeded archive members.
-  //
-  // Note that the symbol resolution inside finalize_archive_extraction uses a
-  // different rule. In order to prevent extracting archive members that can be
-  // satisfied by either non-archive object files or DSOs, the archive members
-  // are given a lower priority. This is not correct for the general case, where
-  // *extracted* object files have precedence over DSOs and even non-archive
-  // files that are passed earlier in the command line. Hence, the symbol
-  // resolution is thrown away once we determine which archive members to
-  // extract, and redone later with the formal rule.
-  {
-    Timer t(ctx, "extract_archive_members");
-
-    // Register symbols
+  for (;;) {
+    // Call resolve_symbols() to find the most appropriate file for each
+    // symbol. And then mark reachable objects to decide which files to
+    // include into an output.
     tbb::parallel_for_each(files, [&](InputFile<E> *file) {
       file->resolve_symbols(ctx);
     });
 
-    // Mark reachable objects to decide which files to include into an output.
-    // This also merges symbol visibility.
     mark_live_objects(ctx);
 
-    // Cleanup. The rule used for archive extraction isn't accurate for the
-    // general case of symbol extraction, so reset the resolution to be redone
-    // later.
-    clear_symbols(ctx);
-
-    // Now that the symbol references are gone, remove the eliminated files from
-    // the file list.
-    std::erase_if(files, [](InputFile<E> *file) { return !file->is_alive; });
-    std::erase_if(ctx.objs, [](InputFile<E> *file) { return !file->is_alive; });
-    std::erase_if(ctx.dsos, [](InputFile<E> *file) { return !file->is_alive; });
-  }
-
-  // COMDAT elimination needs to happen exactly here.
-  //
-  // It needs to be after archive extraction, otherwise we might assign COMDAT
-  // leader to an archive member that is not supposed to be extracted.
-  //
-  // It needs to happen before symbol resolution, otherwise we could eliminate
-  // a symbol that is already resolved to and cause dangling references.
-  {
-    Timer t(ctx, "eliminate_comdats");
-
-    tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-      for (ComdatGroupRef<E> &ref : file->comdat_groups)
-        update_minimum(ref.group->owner, file->priority);
-    });
-
-    tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
-      for (ComdatGroupRef<E> &ref : file->comdat_groups)
-        if (ref.group->owner != file->priority)
-          for (u32 i : ref.members)
-            if (file->sections[i])
-              file->sections[i]->kill();
-    });
-  }
-
-  // Since we have turned on object files live bits, their symbols
-  // may now have higher priority than before. So run the symbol
-  // resolution pass again to get the final resolution result.
-  tbb::parallel_for_each(files, [&](InputFile<E> *file) {
-    file->resolve_symbols(ctx);
-  });
-}
-
-template <typename E>
-void resolve_symbols(Context<E> &ctx) {
-  Timer t(ctx, "resolve_symbols");
-
-  std::vector<ObjectFile<E> *> objs = ctx.objs;
-  std::vector<SharedFile<E> *> dsos = ctx.dsos;
-
-  do_resolve_symbols(ctx);
-
-  bool has_lto_obj = false;
-  for (ObjectFile<E> *file : objs)
-    if (file->is_alive && (file->is_lto_obj || file->is_gcc_offload_obj))
-      has_lto_obj = true;
-
-  if (has_lto_obj) {
-    // Do link-time optimization. We pass all IR object files to the
-    // compiler backend to compile them into a few ELF object files.
+    // Now that we know the exact set of input files that are to be
+    // included in the output file, we want to redo symbol resolution.
+    // This is because symbols defined by object files in archive files
+    // may have risen as a result of mark_live_objects().
     //
-    // The compiler backend needs to know how symbols are resolved,
-    // so compute symbol visibility, import/export bits, etc early.
-    mark_live_objects(ctx);
-    apply_version_script(ctx);
-    parse_symbol_version(ctx);
-    compute_import_export(ctx);
-
-    // Do LTO. It compiles IR object files into a few big ELF files.
-    std::vector<ObjectFile<E> *> lto_objs = do_lto(ctx);
-
-    // do_resolve_symbols() have removed unreferenced files. Restore the
-    // original files here because some of them may have to be resurrected
-    // because they are referenced by the ELF files returned from do_lto().
-    ctx.objs = objs;
-    ctx.dsos = dsos;
-
-    append(ctx.objs, lto_objs);
-
-    // Redo name resolution from scratch.
+    // To redo symbol resolution, we want to clear the state first.
     clear_symbols(ctx);
 
-    // Remove IR object files.
-    for (ObjectFile<E> *file : ctx.objs)
-      if (file->is_lto_obj)
-        file->is_alive = false;
+    // COMDAT elimination needs to happen exactly here.
+    //
+    // It needs to be after archive extraction, otherwise we might
+    // assign COMDAT leader to an archive member that is not supposed to
+    // be extracted.
+    //
+    // It needs to happen before the final symbol resolution, otherwise
+    // we could eliminate a symbol that is already resolved to and cause
+    // dangling references.
+    tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
+      if (file->is_alive)
+        for (ComdatGroupRef<E> &ref : file->comdat_groups)
+          update_minimum(ref.group->owner, file->priority);
+    });
 
-    std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return file->is_lto_obj; });
+    tbb::parallel_for_each(ctx.objs, [](ObjectFile<E> *file) {
+      if (file->is_alive)
+        for (ComdatGroupRef<E> &ref : file->comdat_groups)
+          if (ref.group->owner != file->priority)
+            for (u32 i : ref.members)
+              if (InputSection<E> *isec = file->sections[i].get())
+                isec->is_alive = false;
+    });
 
-    do_resolve_symbols(ctx);
+    // Redo symbol resolution
+    tbb::parallel_for_each(files, [&](InputFile<E> *file) {
+      if (file->is_alive)
+        file->resolve_symbols(ctx);
+    });
+
+    // Symbols with hidden visibility need to be resolved within the
+    // output file. If a hidden symbol was resolved to a DSO, we'll redo
+    // symbol resolution from scratch with the flag to skip that symbol
+    // next time. This should be rare.
+    std::atomic_bool flag = false;
+
+    tbb::parallel_for_each(ctx.dsos, [&](SharedFile<E> *file) {
+      if (file->is_alive) {
+        for (Symbol<E> *sym : file->symbols) {
+          if (sym->file == file && sym->visibility == STV_HIDDEN) {
+            sym->skip_dso = true;
+            flag = true;
+          }
+        }
+      }
+    });
+
+    if (!flag)
+      return;
+
+    clear_symbols(ctx);
+    resolve_symbols(ctx);
   }
 }
 
-// .eh_frame sections are parsed and regenerated by the linker for the purpose
-// of deduplication and garbage collection. As such, the input sections should
-// not be copied over.
-//
-// However, in very rare cases (e.g. GCC CRT compiled with LTO) we might need
-// to resolve cross-object .eh_frame section references (they only point to
-// begin or end and don't depend on the actual section contents).
-// Therefore, the sections are "killed" after symbol resolution as a separate
-// pass.
+// Do link-time optimization. We pass all IR object files to the compiler
+// backend to compile them into a few ELF object files.
 template <typename E>
-void kill_eh_frame_sections(Context<E> &ctx) {
-  Timer t(ctx, "kill_eh_frame_sections");
+void do_lto(Context<E> &ctx) {
+  Timer t(ctx, "do_lto");
 
+  // The compiler backend needs to know how symbols are resolved, so
+  // compute symbol visibility, import/export bits, etc early.
+  mark_live_objects(ctx);
+  apply_version_script(ctx);
+  parse_symbol_version(ctx);
+  compute_import_export(ctx);
+
+  // Invoke the LTO plugin. This step compiles IR object files into a few
+  // big ELF files.
+  std::vector<ObjectFile<E> *> lto_objs = run_lto_plugin(ctx);
+  append(ctx.objs, lto_objs);
+
+  // Redo name resolution.
+  clear_symbols(ctx);
+
+  // Remove IR object files.
   for (ObjectFile<E> *file : ctx.objs)
-    for (InputSection<E> *sec : file->eh_frame_sections)
-      sec->is_alive = false;
+    if (file->is_lto_obj)
+      file->is_alive = false;
+
+  std::erase_if(ctx.objs, [](ObjectFile<E> *file) { return file->is_lto_obj; });
+
+  resolve_symbols(ctx);
+}
+
+template <typename E>
+void parse_eh_frame_sections(Context<E> &ctx) {
+  Timer t(ctx, "parse_eh_frame_sections");
+
+  tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
+    file->parse_ehframe(ctx);
+
+    for (InputSection<E> *isec : file->eh_frame_sections)
+      isec->is_alive = false;
+  });
 }
 
 template <typename E>
@@ -1123,14 +1097,11 @@ void check_symbol_types(Context<E> &ctx) {
   append(files, ctx.dsos);
 
   auto canonicalize = [](u32 ty) -> u32 {
-    switch (ty) {
-    case STT_GNU_IFUNC:
+    if (ty == STT_GNU_IFUNC)
       return STT_FUNC;
-    case STT_COMMON:
+    if (ty == STT_COMMON)
       return STT_OBJECT;
-    default:
-      return ty;
-    }
+    return ty;
   };
 
   tbb::parallel_for_each(files.begin(), files.end(), [&](InputFile<E> *file) {
@@ -1190,6 +1161,11 @@ template <typename E>
 void sort_init_fini(Context<E> &ctx) {
   Timer t(ctx, "sort_init_fini");
 
+  struct Entry {
+    InputSection<E> *sect;
+    i64 prio;
+  };
+
   for (Chunk<E> *chunk : ctx.chunks) {
     if (OutputSection<E> *osec = chunk->to_osec()) {
       if (osec->name == ".init_array" || osec->name == ".preinit_array" ||
@@ -1197,19 +1173,20 @@ void sort_init_fini(Context<E> &ctx) {
         if (ctx.arg.shuffle_sections == SHUFFLE_SECTIONS_REVERSE)
           std::reverse(osec->members.begin(), osec->members.end());
 
-        std::unordered_map<InputSection<E> *, i64> map;
+        std::vector<Entry> vec;
 
         for (InputSection<E> *isec : osec->members) {
           std::string_view name = isec->name();
           if (name.starts_with(".ctors") || name.starts_with(".dtors"))
-            map.insert({isec, 65535 - get_ctor_dtor_priority(isec)});
+            vec.push_back({isec, 65535 - get_ctor_dtor_priority(isec)});
           else
-            map.insert({isec, get_init_fini_priority(isec)});
+            vec.push_back({isec, get_init_fini_priority(isec)});
         }
 
-        sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
-          return map[a] < map[b];
-        });
+        sort(vec, [&](const Entry &a, const Entry &b) { return a.prio < b.prio; });
+
+        for (i64 i = 0; i < vec.size(); i++)
+          osec->members[i] = vec[i].sect;
       }
     }
   }
@@ -1219,19 +1196,25 @@ template <typename E>
 void sort_ctor_dtor(Context<E> &ctx) {
   Timer t(ctx, "sort_ctor_dtor");
 
+  struct Entry {
+    InputSection<E> *sect;
+    i64 prio;
+  };
+
   for (Chunk<E> *chunk : ctx.chunks) {
     if (OutputSection<E> *osec = chunk->to_osec()) {
       if (osec->name == ".ctors" || osec->name == ".dtors") {
         if (ctx.arg.shuffle_sections != SHUFFLE_SECTIONS_REVERSE)
           std::reverse(osec->members.begin(), osec->members.end());
 
-        std::unordered_map<InputSection<E> *, i64> map;
+        std::vector<Entry> vec;
         for (InputSection<E> *isec : osec->members)
-          map.insert({isec, get_ctor_dtor_priority(isec)});
+          vec.push_back({isec, get_ctor_dtor_priority(isec)});
 
-        sort(osec->members, [&](InputSection<E> *a, InputSection<E> *b) {
-          return map[a] < map[b];
-        });
+        sort(vec, [&](const Entry &a, const Entry &b) { return a.prio < b.prio; });
+
+        for (i64 i = 0; i < vec.size(); i++)
+          osec->members[i] = vec[i].sect;
       }
     }
   }
@@ -1467,6 +1450,14 @@ void scan_relocations(Context<E> &ctx) {
   // Scan relocations to find dynamic symbols.
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->scan_relocations(ctx);
+  });
+
+  // Word-size absolute relocations (e.g. R_X86_64_64) are handled
+  // separately because they can be promoted to dynamic relocations.
+  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+    if (OutputSection<E> *osec = chunk->to_osec())
+      if (osec->shdr.sh_flags & SHF_ALLOC)
+        osec->scan_abs_relocations(ctx);
   });
 
   // Exit if there was a relocation that refers an undefined symbol.
@@ -1753,11 +1744,9 @@ template <typename E>
 void create_output_symtab(Context<E> &ctx) {
   Timer t(ctx, "compute_symtab_size");
 
-  if (!ctx.arg.strip_all && !ctx.arg.retain_symbols_file) {
-    tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
-      chunk->compute_symtab_size(ctx);
-    });
-  }
+  tbb::parallel_for_each(ctx.chunks, [&](Chunk<E> *chunk) {
+    chunk->compute_symtab_size(ctx);
+  });
 
   tbb::parallel_for_each(ctx.objs, [&](ObjectFile<E> *file) {
     file->compute_symtab_size(ctx);
@@ -3076,8 +3065,8 @@ void write_separate_debug_file(Context<E> &ctx) {
   Timer t(ctx, "write_separate_debug_file");
 
   // Open an output file early
-  LockingOutputFile<Context<E>> *file =
-    new LockingOutputFile<Context<E>>(ctx, ctx.arg.separate_debug_file, 0666);
+  LockingOutputFile<E> *file =
+    new LockingOutputFile<E>(ctx, ctx.arg.separate_debug_file, 0666);
 
   // We want to write to the debug info file in background so that the
   // user doesn't have to wait for it to complete.
@@ -3237,7 +3226,8 @@ template void create_internal_file(Context<E> &);
 template void apply_exclude_libs(Context<E> &);
 template void create_synthetic_sections(Context<E> &);
 template void resolve_symbols(Context<E> &);
-template void kill_eh_frame_sections(Context<E> &);
+template void do_lto(Context<E> &);
+template void parse_eh_frame_sections(Context<E> &);
 template void create_merged_sections(Context<E> &);
 template void convert_common_symbols(Context<E> &);
 template void create_output_sections(Context<E> &);
