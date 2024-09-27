@@ -49,8 +49,6 @@ int redo_main(Context<E> &ctx, int argc, char **argv) {
     return mold_main<M68K>(argc, argv);
   if (target == SH4::target_name)
     return mold_main<SH4>(argc, argv);
-  if (target == ALPHA::target_name)
-    return mold_main<ALPHA>(argc, argv);
   if (target == LOONGARCH32::target_name)
     return mold_main<LOONGARCH32>(argc, argv);
   if (target == LOONGARCH64::target_name)
@@ -188,9 +186,6 @@ void create_synthetic_sections(Context<E> &ctx) {
 
   if constexpr (is_ppc64v2<E>)
     ctx.extra.save_restore = push(new PPC64SaveRestoreSection);
-
-  if constexpr (is_alpha<E>)
-    ctx.extra.got = push(new AlphaGotSection);
 }
 
 template <typename E>
@@ -1234,33 +1229,30 @@ template <typename E>
 void fixup_ctors_in_init_array(Context<E> &ctx) {
   Timer t(ctx, "fixup_ctors_in_init_array");
 
-  auto fixup = [&](OutputSection<E> &osec) {
-    for (InputSection<E> *isec : osec.members) {
-      if (isec->name().starts_with(".ctors") ||
-          isec->name().starts_with(".dtors")) {
-        if (isec->sh_size % sizeof(Word<E>)) {
-          Error(ctx) << *isec << ": section corrupted";
-          continue;
-        }
+  auto reverse = [&](InputSection<E> &isec) {
+    if (isec.sh_size % sizeof(Word<E>))
+      Fatal(ctx) << isec << ": section corrupted";
 
-        u8 *buf = (u8 *)isec->contents.data();
-        std::reverse((Word<E> *)buf, (Word<E> *)(buf + isec->sh_size));
+    u8 *buf = (u8 *)isec.contents.data();
+    std::reverse((Word<E> *)buf, (Word<E> *)(buf + isec.sh_size));
 
-        std::span<ElfRel<E>> rels = isec->get_rels(ctx);
-        for (ElfRel<E> &r : rels)
-          r.r_offset = isec->sh_size - r.r_offset - sizeof(Word<E>);
-        std::reverse(rels.begin(), rels.end());
-      }
-    }
+    std::span<ElfRel<E>> rels = isec.get_rels(ctx);
+    for (ElfRel<E> &r : rels)
+      r.r_offset = isec.sh_size - r.r_offset - sizeof(Word<E>);
+    std::reverse(rels.begin(), rels.end());
   };
 
   if (Chunk<E> *chunk = find_chunk(ctx, ".init_array"))
     if (OutputSection<E> *osec = chunk->to_osec())
-      fixup(*osec);
+      for (InputSection<E> *isec : osec->members)
+        if (isec->name().starts_with(".ctors"))
+          reverse(*isec);
 
   if (Chunk<E> *chunk = find_chunk(ctx, ".fini_array"))
     if (OutputSection<E> *osec = chunk->to_osec())
-      fixup(*osec);
+      for (InputSection<E> *isec : osec->members)
+        if (isec->name().starts_with(".dtors"))
+          reverse(*isec);
 }
 
 template <typename T>
@@ -1532,9 +1524,6 @@ void scan_relocations(Context<E> &ctx) {
 
     sym->flags = 0;
   }
-
-  if constexpr (is_alpha<E>)
-    ctx.extra.got->finalize();
 
   if (ctx.has_textrel && ctx.arg.warn_textrel)
     Warn(ctx) << "creating a DT_TEXTREL in an output file";
@@ -2145,7 +2134,6 @@ void compute_address_significance(Context<E> &ctx) {
 //   <writable RELRO data>
 //   .got
 //   .toc
-//   .alpha_got
 //   <writable RELRO bss>
 //   .relro_padding
 //   <writable non-RELRO data>
@@ -2238,8 +2226,6 @@ void sort_output_sections_regular(Context<E> &ctx) {
       return 2;
     if (chunk->name == ".toc")
       return 3;
-    if (chunk->name == ".alpha_got")
-      return 4;
     if (chunk == ctx.relro_padding)
       return INT64_MAX;
     return 0;
